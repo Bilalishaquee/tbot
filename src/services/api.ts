@@ -16,64 +16,59 @@ export const getMarketData = async (pair: string): Promise<MarketData> => {
   );
   
   const data = await response.json();
-  const rate = data['Realtime Currency Exchange Rate'];
   
+  if (!data['Realtime Currency Exchange Rate']) {
+    throw new Error('Failed to fetch real-time exchange rate');
+  }
+  
+  const rate = data['Realtime Currency Exchange Rate'];
   const price = parseFloat(rate['5. Exchange Rate']);
+  const timestamp = new Date(rate['6. Last Refreshed']).getTime();
   
   return {
     pair,
     price,
-    high: price * 1.001, // Estimated
-    low: price * 0.999,  // Estimated
+    high: price,
+    low: price,
     open: price,
     close: price,
-    timestamp: Date.now(),
-    volume: Math.floor(Math.random() * 1000), // Dummy volume
+    timestamp,
+    volume: 0
   };
-};
-
-/**
- * Fetch 5-minute interval chart data for a currency pair
- */
-export const getForexChartData = async (pair: string) => {
-  const fromCurrency = pair.slice(0, 3).toUpperCase();
-  const toCurrency = pair.slice(3, 6).toUpperCase();
-
-  const response = await fetch(
-    `${BASE_URL}?function=FX_INTRADAY&from_symbol=${fromCurrency}&to_symbol=${toCurrency}&interval=5min&apikey=${ALPHA_VANTAGE_API_KEY}&outputsize=compact`
-  );
-
-  const data = await response.json();
-  const timeSeries = data['Time Series FX (5min)'];
-
-  if (!timeSeries) {
-    throw new Error('Invalid API response from Alpha Vantage');
-  }
-
-  return Object.entries(timeSeries).map(([time, values]: any) => ({
-    time,
-    open: parseFloat(values['1. open']),
-    high: parseFloat(values['2. high']),
-    low: parseFloat(values['3. low']),
-    close: parseFloat(values['4. close']),
-  }));
 };
 
 /**
  * Fetch historical market data for a currency pair
  */
 export const getHistoricalData = async (pair: string, timeframe: number): Promise<MarketData[]> => {
-  const chartData = await getForexChartData(pair);
-  return chartData.slice(0, timeframe).map(data => ({
-    pair,
-    price: data.close,
-    high: data.high,
-    low: data.low,
-    open: data.open,
-    close: data.close,
-    timestamp: new Date(data.time).getTime(),
-    volume: Math.floor(Math.random() * 1000), // Dummy volume for demo
-  }));
+  const fromCurrency = pair.slice(0, 3).toUpperCase();
+  const toCurrency = pair.slice(3, 6).toUpperCase();
+
+  // Get intraday data with 1min intervals for accurate signals
+  const response = await fetch(
+    `${BASE_URL}?function=FX_INTRADAY&from_symbol=${fromCurrency}&to_symbol=${toCurrency}&interval=1min&apikey=${ALPHA_VANTAGE_API_KEY}&outputsize=full`
+  );
+
+  const data = await response.json();
+  const timeSeries = data['Time Series FX (1min)'];
+
+  if (!timeSeries) {
+    throw new Error('Failed to fetch historical data');
+  }
+
+  return Object.entries(timeSeries)
+    .slice(0, timeframe * 5) // Get enough data points for technical analysis
+    .map(([time, values]: [string, any]) => ({
+      pair,
+      price: parseFloat(values['4. close']),
+      high: parseFloat(values['2. high']),
+      low: parseFloat(values['3. low']),
+      open: parseFloat(values['1. open']),
+      close: parseFloat(values['4. close']),
+      timestamp: new Date(time).getTime(),
+      volume: 0
+    }))
+    .reverse(); // Most recent data first
 };
 
 /**
@@ -84,7 +79,8 @@ export const generateSignal = async (pair: string, timeframe: number): Promise<S
   const prices = historicalData.map(d => d.close);
   
   // Calculate technical indicators
-  const sma = SMA.calculate({ period: 14, values: prices });
+  const smaShort = SMA.calculate({ period: 10, values: prices });
+  const smaLong = SMA.calculate({ period: 20, values: prices });
   const rsi = RSI.calculate({ period: 14, values: prices });
   const macd = MACD.calculate({
     fastPeriod: 12,
@@ -93,63 +89,86 @@ export const generateSignal = async (pair: string, timeframe: number): Promise<S
     values: prices
   });
   
-  // Simple signal generation logic
   const lastPrice = prices[prices.length - 1];
-  const lastSMA = sma[sma.length - 1];
+  const lastSMAShort = smaShort[smaShort.length - 1];
+  const lastSMALong = smaLong[smaLong.length - 1];
   const lastRSI = rsi[rsi.length - 1];
   const lastMACD = macd[macd.length - 1];
   
-  let signal: 'buy' | 'sell' | 'hold' = 'hold';
+  let direction: 'buy' | 'sell' | 'neutral' = 'neutral';
+  let confidence = 0;
   
-  if (lastPrice > lastSMA && lastRSI < 70 && lastMACD.histogram > 0) {
-    signal = 'buy';
-  } else if (lastPrice < lastSMA && lastRSI > 30 && lastMACD.histogram < 0) {
-    signal = 'sell';
+  // Trading logic based on multiple indicators
+  if (lastSMAShort > lastSMALong && lastRSI < 70 && lastMACD.histogram > 0) {
+    direction = 'buy';
+    confidence = Math.min(
+      ((70 - lastRSI) / 30) * 0.4 + // RSI weight
+      (lastMACD.histogram / Math.abs(lastMACD.histogram)) * 0.3 + // MACD weight
+      ((lastSMAShort - lastSMALong) / lastSMALong) * 0.3, // SMA weight
+      1
+    );
+  } else if (lastSMAShort < lastSMALong && lastRSI > 30 && lastMACD.histogram < 0) {
+    direction = 'sell';
+    confidence = Math.min(
+      ((lastRSI - 30) / 30) * 0.4 + // RSI weight
+      (Math.abs(lastMACD.histogram) / lastMACD.histogram) * 0.3 + // MACD weight
+      ((lastSMALong - lastSMAShort) / lastSMALong) * 0.3, // SMA weight
+      1
+    );
   }
   
   return {
     pair,
-    signal,
-    price: lastPrice,
+    timeframe,
+    direction,
+    confidence,
     timestamp: Date.now(),
-    expiryTime: Date.now() + 300000, // Signal expires in 5 minutes
-    indicators: {
-      sma: lastSMA,
-      rsi: lastRSI,
-      macd: lastMACD
-    }
+    price: lastPrice,
+    expiryTime: Date.now() + (timeframe * 60 * 1000) // Signal expires after timeframe
   };
 };
 
 /**
- * Get performance metrics for the signal generator
+ * Get performance metrics based on historical signals
  */
 export const getPerformanceMetrics = async (pair: string, timeframe: number): Promise<PerformanceMetric> => {
-  const historicalData = await getHistoricalData(pair, timeframe);
+  const historicalData = await getHistoricalData(pair, timeframe * 2); // Get double the timeframe for backtesting
+  let totalSignals = 0;
+  let successfulSignals = 0;
   
-  // Calculate mock performance metrics
-  const totalTrades = 100;
-  const winningTrades = Math.floor(Math.random() * 70) + 30; // 30-100 winning trades
-  const losingTrades = totalTrades - winningTrades;
-  
-  const averageWin = Math.random() * 2 + 1; // 1-3% average win
-  const averageLoss = Math.random() * 1 + 0.5; // 0.5-1.5% average loss
+  // Simple backtesting
+  for (let i = 0; i < historicalData.length - timeframe; i++) {
+    const testData = historicalData.slice(i, i + timeframe);
+    const prices = testData.map(d => d.close);
+    
+    const sma = SMA.calculate({ period: 14, values: prices });
+    const rsi = RSI.calculate({ period: 14, values: prices });
+    const macd = MACD.calculate({
+      fastPeriod: 12,
+      slowPeriod: 26,
+      signalPeriod: 9,
+      values: prices
+    });
+    
+    if (sma.length > 0 && rsi.length > 0 && macd.length > 0) {
+      const signal = macd[macd.length - 1].histogram > 0 ? 'buy' : 'sell';
+      const futurePrice = historicalData[i + timeframe]?.close;
+      
+      if (futurePrice) {
+        totalSignals++;
+        if ((signal === 'buy' && futurePrice > prices[prices.length - 1]) ||
+            (signal === 'sell' && futurePrice < prices[prices.length - 1])) {
+          successfulSignals++;
+        }
+      }
+    }
+  }
   
   return {
     pair,
     timeframe,
-    totalTrades,
-    winningTrades,
-    losingTrades,
-    winRate: (winningTrades / totalTrades) * 100,
-    averageWin,
-    averageLoss,
-    profitFactor: (winningTrades * averageWin) / (losingTrades * averageLoss),
-    sharpeRatio: Math.random() * 1 + 0.5, // Mock Sharpe ratio
-    maxDrawdown: Math.random() * 10 + 5, // 5-15% max drawdown
-    period: {
-      start: historicalData[historicalData.length - 1].timestamp,
-      end: historicalData[0].timestamp
-    }
+    winRate: successfulSignals / totalSignals,
+    totalSignals,
+    successfulSignals,
   };
 };
